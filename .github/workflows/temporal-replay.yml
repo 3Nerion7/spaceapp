@@ -31,6 +31,9 @@ jobs:
       - name: Build dependencies and typecheck
         working-directory: ${{ runner.temp }}/spaceapp-temporal-export
         run: npm run check
+      - name: Typecheck the Temporal tests and fixtures
+        working-directory: ${{ runner.temp }}/spaceapp-temporal-export
+        run: npm run check:temporal-tests -w @space/worker
       - name: Run real sandbox and committed replay fixtures within three minutes
         working-directory: ${{ runner.temp }}/spaceapp-temporal-export
         run: timeout --signal=TERM --kill-after=10s 180s npm test -w @space/worker -- tests/temporal-workflows.test.ts

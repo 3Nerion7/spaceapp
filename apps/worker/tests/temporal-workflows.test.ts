@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Context } from "@temporalio/activity";
 import { WorkflowContinuedAsNewError, WorkflowFailedError, WorkflowNotFoundError } from "@temporalio/client";
-import { ActivityFailure, ApplicationFailure, defaultPayloadConverter } from "@temporalio/common";
+import { ActivityFailure, ApplicationFailure, defaultPayloadConverter, TimeoutFailure, TimeoutType } from "@temporalio/common";
 import { temporal } from "@temporalio/proto";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
 import { Worker, bundleWorkflowCode } from "@temporalio/worker";
@@ -111,7 +111,13 @@ async function remember(name: typeof historyNames[number], handle: Handle) {
   await writeFile(`${historiesDir}/${name}.json`, `${JSON.stringify(artifact, (key, value) =>
     key === "stackTrace" ? "Synthetic test failure (local stack omitted)" : value, 2)}\n`, "utf8");
 }
-async function continued(handle: Handle) {
+function supervisorContinuationInput(raw: unknown) {
+  roomAgentSupervisorInputSchema.parse(raw);
+  // Validate the payload, but inspect its original fields: returning the
+  // parsed output would let schema defaults hide missing carried state.
+  return raw as Partial<ReturnType<typeof roomAgentSupervisorInputSchema.parse>>;
+}
+async function continued<T>(handle: Handle, parseInput: (input: unknown) => T) {
   const pinned = env.client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId);
   let event: any;
   const startTime = await env.currentTimeMs();
@@ -138,7 +144,7 @@ async function continued(handle: Handle) {
     }));
     throw error;
   }
-  return { pinned, input: defaultPayloadConverter.fromPayload(event.input.payloads[0]), runId: event.newExecutionRunId };
+  return { pinned, input: parseInput(defaultPayloadConverter.fromPayload(event.input.payloads[0])), runId: event.newExecutionRunId };
 }
 async function closedContinuation(handle: Handle) {
   // A single close-event long poll lets the test server skip time without a
@@ -162,7 +168,7 @@ async function closedContinuation(handle: Handle) {
   const event = history.events?.find((value) => value.workflowExecutionContinuedAsNewEventAttributes)?.workflowExecutionContinuedAsNewEventAttributes;
   expect(event, "The closed run must contain a real continue-as-new event").toBeDefined();
   expect(event!.newExecutionRunId).toBe(continuation.newExecutionRunId);
-  return { pinned, history, input: defaultPayloadConverter.fromPayload(event!.input!.payloads![0]!), runId: event!.newExecutionRunId };
+  return { pinned, history, input: supervisorContinuationInput(defaultPayloadConverter.fromPayload(event!.input!.payloads![0]!)), runId: event!.newExecutionRunId };
 }
 async function stop(handle: Handle) {
   try { await env.client.workflow.getHandle(handle.workflowId).terminate("Synthetic test cleanup"); }
@@ -193,6 +199,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     environmentActive = true;
     const activities = Object.fromEntries(activityNames.map((name) => [name, async (...args: any[]) => {
       const info = Context.current().info;
+      if (!info.workflowExecution) throw new Error("Test activity requires a workflow execution");
       calls.push({ name, args, attempt: info.attempt, workflowId: info.workflowExecution.workflowId, runId: info.workflowExecution.runId });
       if (!stubs[name]) {
         unexpectedActivities.push(name);
@@ -275,7 +282,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     const handle = await start("dotGoalWorkflow", { goalId: "goal:unfinished" });
     // result() enables automatic time skipping; attach its rejection handler immediately.
     const result = autoResult(handle);
-    const next = await continued(handle);
+    const next = await continued(handle, (input) => input);
     expect(next.input).toEqual({ goalId: "goal:unfinished" });
     expect(calls.filter((call) => call.name === "dotGoalStep" && call.runId === firstRun)).toHaveLength(300);
     resumed.resolve();
@@ -379,7 +386,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     const c = continuationFixture();
     stubs.prepareRoomAgentBackgroundContinuation = (input) => prepareBackgroundContinuation(input, c.store);
     stubs.checkRoomAgentSupervisorTurn = (queued) => supervisorTurnState(queued, c.store);
-    stubs.discardRoomAgentSupervisorTurn = ({ item, reason }) => discardSupervisorTurn(item, reason, c.store);
+    stubs.discardRoomAgentSupervisorTurn = ({ item, reason, errorCode }) => discardSupervisorTurn(item, reason, c.store, errorCode);
     stubs.finishRoomAgentSupervisorTurn = (input) => finishSupervisorTurn(input, c.store);
     stubs.runCodexAppServerTurn = (input) => { c.store.updateSpaceAgentRun(input.agentRunId, { status: "COMPLETED" }); return turnResult; };
     return c;
@@ -405,6 +412,45 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     expect(count("finishRoomAgentSupervisorTurn")).toBe(1);
     await stop(handle);
   });
+
+  it.each([
+    ["a serialized plain error", () => new Error("Synthetic supervisor child failure"), "ROOM_AGENT_SUPERVISOR_FAILED"],
+    ["a serialized SDK timeout cause", () => ApplicationFailure.create({
+      message: "Synthetic activity failure with timeout cause", type: "Error", nonRetryable: true,
+      cause: new TimeoutFailure("Synthetic timeout cause", undefined, TimeoutType.START_TO_CLOSE)
+    }), "ROOM_AGENT_SUPERVISOR_TIMEOUT"],
+    ["a serialized application failure type", () => ApplicationFailure.nonRetryable("Synthetic typed child failure", "CODEX_APP_SERVER_TURN_TIMEOUT"), "CODEX_APP_SERVER_TURN_TIMEOUT"]
+  ] as const)("current supervisor records %s as FAILED with its cause code", async (_, makeError, code) => {
+    const c = continuationDriver();
+    stubs.runCodexAppServerTurn = () => { throw makeError(); };
+    const handle = await start("roomAgentSupervisorWorkflow", roomAgentSupervisorInputSchema.parse({
+      roomId: c.room.id, monitoringMissionIds: [c.initial.mission.id]
+    }));
+    // Keep the real server's automatic time skipping active across activity
+    // retry backoffs. The idle supervisor is terminated after the assertions.
+    autoResult(handle);
+    await until(() => calls.some((call) => call.name === "finishRoomAgentSupervisorTurn" && call.args[0].status === "FAILED"), "failed supervisor turn persistence");
+    const childCall = calls.find((call) => call.name === "runCodexAppServerTurn")!;
+    const runId = childCall.args[0].agentRunId;
+    expect(c.store.getRoomAgentTurn(c.initial.mission.id, runId)?.run).toMatchObject({ status: "FAILED", errorCode: code });
+    expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("FAILED");
+    expect(calls.find((call) => call.name === "finishRoomAgentSupervisorTurn")?.args[0]).toMatchObject({ status: "FAILED", errorCode: code });
+    // Only the activity body is stubbed. Its SDK failure travels through the
+    // real activity -> child -> supervisor boundary; it is not a fabricated
+    // ChildWorkflowFailure object. An ApplicationFailure preserves the injected
+    // TimeoutFailure cause (an activity throwing TimeoutFailure directly is
+    // converted to an ApplicationFailure by the SDK). This tests classification
+    // of the transported cause, not the expiry of a server deadline.
+    const history = await handle.fetchHistory();
+    const childFailure = history.events?.find((event) => event.childWorkflowExecutionFailedEventAttributes)?.childWorkflowExecutionFailedEventAttributes?.failure;
+    expect(childFailure?.activityFailureInfo).toBeDefined();
+    if (code === "ROOM_AGENT_SUPERVISOR_TIMEOUT") {
+      expect(childFailure?.cause?.cause?.timeoutFailureInfo?.timeoutType).toBe(temporal.api.enums.v1.TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE);
+    } else {
+      expect(childFailure?.cause?.applicationFailureInfo?.type).toBe(code === "ROOM_AGENT_SUPERVISOR_FAILED" ? "Error" : code);
+    }
+    await stop(handle);
+  }, 25_000);
 
   it.each(["stop", "follow-up"])("current supervisor retires a prepared continuation when %s wins the race", async (kind) => {
     const c = continuationDriver();
@@ -441,7 +487,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     stubs.checkRoomAgentSupervisorTurn = async (queued) => { await release.promise; return supervisorTurnState(queued, c.store); };
     const handle = await start("roomAgentSupervisorWorkflow", roomAgentSupervisorInputSchema.parse({ roomId: c.room.id, monitoringMissionIds: [c.initial.mission.id], processedCount: 50 }));
     await env.sleep("1 second");
-    const next = await continued(handle);
+    const next = await continued(handle, supervisorContinuationInput);
     expect(next.input.pending).toHaveLength(1);
     expect(next.input.monitoringMissionIds).toEqual([c.initial.mission.id]);
     expect(next.input.processedCount).toBe(0);
@@ -469,12 +515,12 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     await until(() => count("checkRoomAgentSupervisorTurn") === 1, "first gated turn");
     for (let index = 1; index <= 105; index++) await handle.signal(ROOM_AGENT_ENQUEUE_SIGNAL, item(`flood-${index}`));
     firstCheck.resolve();
-    const next = await continued(handle);
+    const next = await continued(handle, supervisorContinuationInput);
     expect(next.input.pending).toHaveLength(100);
     expect(() => roomAgentSupervisorInputSchema.parse(next.input)).not.toThrow();
     expect(calls.filter((call) => call.name === "checkRoomAgentSupervisorTurn" && call.runId === originalRun)).toHaveLength(6);
     const drained = calls.filter((call) => call.name === "discardRoomAgentSupervisorTurn").map((call) => call.args[0].item.turn.agentRunId);
-    expect(new Set([...drained, ...next.input.pending.map((queued: any) => queued.turn.agentRunId)]).size).toBe(106);
+    expect(new Set([...drained, ...next.input.pending!.map((queued) => queued.turn.agentRunId)]).size).toBe(106);
     nextRun.resolve();
     await stop(handle);
   }, 25_000);
@@ -603,7 +649,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     };
     const a = item("legacy-first"), b = item("legacy-second");
     const handle = await start("roomAgentSupervisorWorkflow", roomAgentSupervisorInputSchema.parse({ roomId: "room:synthetic", pending: [a, b], monitoringMissionIds: ["mission:other"], processedCount: 49 }), "legacy-50");
-    const next = await continued(handle);
+    const next = await continued(handle, supervisorContinuationInput);
     expect(next.input.pending).toEqual([b]);
     expect(next.input.monitoringMissionIds).toEqual(["mission:other"]);
     expect(next.input.processedCount).toBe(0);
@@ -623,7 +669,7 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
     const a = { item: item("interrupted-a"), reason: "Synthetic interrupted A" };
     const b = { item: item("interrupted-b"), reason: "Synthetic interrupted B" };
     const handle = await start("roomAgentSupervisorWorkflow", roomAgentSupervisorInputSchema.parse({ roomId: "room:synthetic", interrupted: [a, b], processedCount: 49 }));
-    const next = await continued(handle);
+    const next = await continued(handle, supervisorContinuationInput);
     expect(next.input.interrupted).toEqual([b]);
     expect(next.input.processedCount).toBe(0);
     gate.resolve();
