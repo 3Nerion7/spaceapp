@@ -31,17 +31,84 @@ const historyNames = [
 type Handle = Awaited<ReturnType<TestWorkflowEnvironment["client"]["workflow"]["start"]>>;
 type Stub = (...args: any[]) => any;
 let env: TestWorkflowEnvironment;
-let environmentActive = false;
 let bundle: Awaited<ReturnType<typeof bundleWorkflowCode>>;
-let workers: Worker[] = [];
-let running: Promise<void>[] = [];
-let handles: Handle[] = [];
 let stubs: Record<string, Stub> = {};
-let calls: Array<{ name: string; args: any[]; attempt: number; workflowId: string; runId: string }> = [];
-let unexpectedActivities: string[] = [];
-let releaseGates: Array<() => void> = [];
-let automaticResults: Promise<unknown>[] = [];
+type ActivityCall = { name: string; args: any[]; attempt: number; workflowId: string; runId: string };
+let calls: ActivityCall[] = [];
 let serial = 0;
+type SandboxCase = {
+  env?: TestWorkflowEnvironment;
+  workers: Worker[];
+  running: Promise<void>[];
+  handles: Handle[];
+  stubs: Record<string, Stub>;
+  calls: ActivityCall[];
+  unexpectedActivities: string[];
+  releaseGates: Array<() => void>;
+  automaticResults: Promise<unknown>[];
+  activities: Set<Promise<unknown>>;
+  setupPromise: Promise<void>;
+  cleanupPromise?: Promise<void>;
+  teardownPromise?: Promise<void>;
+};
+let activeCase: SandboxCase | undefined;
+const casesByContext = new WeakMap<object, SandboxCase>();
+
+function beginCase(context: object): SandboxCase {
+  // A timed-out hook is not cancellation. Do not replace the aliases while an
+  // earlier environment, worker or tracked activity body remains owned. This
+  // does not cancel arbitrary asynchronous code in a timed-out test body.
+  if (activeCase) throw new Error("Previous sandbox case has not finished closing");
+  const state: SandboxCase = {
+    workers: [], running: [], handles: [], stubs: {}, calls: [], unexpectedActivities: [],
+    releaseGates: [], automaticResults: [], activities: new Set(), setupPromise: Promise.resolve()
+  };
+  activeCase = state;
+  casesByContext.set(context, state);
+  return state;
+}
+function currentCase(): SandboxCase {
+  if (!activeCase) throw new Error("No sandbox case owns the test environment");
+  return activeCase;
+}
+function caseEnvironment(state: SandboxCase): TestWorkflowEnvironment {
+  if (!state.env) throw new Error("Sandbox setup has not created its environment");
+  return state.env;
+}
+async function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out closing ${label}`)), milliseconds);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+function releaseCaseGates(state: SandboxCase) {
+  for (const release of state.releaseGates.splice(0)) release();
+}
+function caseActivity(state: SandboxCase, name: string): Stub {
+  return (...args) => {
+    // Reject a queued callback after shutdown, before touching Context or a
+    // stub body that may use the current test's count()/calls aliases.
+    if (activeCase !== state || state.teardownPromise) {
+      return Promise.reject(ApplicationFailure.nonRetryable("Activity belongs to a closing sandbox case"));
+    }
+    const result = (async () => {
+      const info = Context.current().info;
+      if (!info.workflowExecution) throw new Error("Test activity requires a workflow execution");
+      state.calls.push({ name, args, attempt: info.attempt, workflowId: info.workflowExecution.workflowId, runId: info.workflowExecution.runId });
+      const stub = state.stubs[name];
+      if (!stub) {
+        state.unexpectedActivities.push(name);
+        throw ApplicationFailure.nonRetryable(`Unexpected test activity: ${name}`);
+      }
+      return stub(...args);
+    })();
+    state.activities.add(result);
+    void result.finally(() => state.activities.delete(result)).catch(() => undefined);
+    return result;
+  };
+}
 
 const activityNames = [
   "recordDummyTurnStarted", "recordDummyTurnCompleted", "runOpenCodeAgentTurn", "runCliAgentTurn", "runCodexAppServerTurn",
@@ -55,7 +122,7 @@ const activityNames = [
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
-  releaseGates.push(() => resolve(undefined as T));
+  currentCase().releaseGates.push(() => resolve(undefined as T));
   return { promise, resolve };
 }
 async function until(predicate: () => boolean | Promise<boolean>, label: string) {
@@ -87,16 +154,17 @@ function consolidationRun(id: string) {
   });
 }
 async function start(type: string, input: unknown, suffix = type) {
+  const state = currentCase();
   serial++;
-  const handle = await env.client.workflow.start(type, {
+  const handle = await caseEnvironment(state).client.workflow.start(type, {
     workflowId: suffix.startsWith("space-room-action:") ? suffix : `sandbox-${serial}-${suffix}`, taskQueue: "space-sandbox-tests", args: [input]
   });
-  handles.push(handle);
+  state.handles.push(handle);
   return handle;
 }
 function autoResult(handle: Handle) {
   const result = handle.result();
-  automaticResults.push(result);
+  currentCase().automaticResults.push(result);
   void result.catch(() => undefined);
   return result;
 }
@@ -118,6 +186,8 @@ function supervisorContinuationInput(raw: unknown) {
   return raw as Partial<ReturnType<typeof roomAgentSupervisorInputSchema.parse>>;
 }
 async function continued<T>(handle: Handle, parseInput: (input: unknown) => T) {
+  const state = currentCase();
+  const env = caseEnvironment(state);
   const pinned = env.client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId);
   let event: any;
   const startTime = await env.currentTimeMs();
@@ -135,22 +205,24 @@ async function continued<T>(handle: Handle, parseInput: (input: unknown) => T) {
       if (key.endsWith("EventAttributes")) counts[key] = (counts[key] ?? 0) + 1;
     }
     const activityCounts: Record<string, number> = {};
-    for (const call of calls.filter((value) => value.runId === handle.firstExecutionRunId)) activityCounts[call.name] = (activityCounts[call.name] ?? 0) + 1;
+    for (const call of state.calls.filter((value) => value.runId === handle.firstExecutionRunId)) activityCounts[call.name] = (activityCounts[call.name] ?? 0) + 1;
     console.error("Temporal continuation diagnostic", JSON.stringify({
       workflowId: handle.workflowId, firstRunId: handle.firstExecutionRunId,
       elapsedVirtualMs: (await env.currentTimeMs()) - startTime, eventCounts: counts, activityCounts,
       lastEventId: events.at(-1)?.eventId?.toString(), lastEventType: events.at(-1)?.eventType,
-      inFlightActivities: workers.map((worker) => ({ taskQueue: worker.options.taskQueue, count: worker.getStatus().numInFlightActivities }))
+      inFlightActivities: state.workers.map((worker) => ({ taskQueue: worker.options.taskQueue, count: worker.getStatus().numInFlightActivities }))
     }));
     throw error;
   }
   return { pinned, input: parseInput(defaultPayloadConverter.fromPayload(event.input.payloads[0])), runId: event.newExecutionRunId };
 }
 async function closedContinuation(handle: Handle) {
+  const state = currentCase();
+  const env = caseEnvironment(state);
   // A single close-event long poll lets the test server skip time without a
   // growing stream of full-history reads. Do not follow the infinite next run.
   const result = env.client.workflow.result(handle.workflowId, handle.firstExecutionRunId, { followRuns: false });
-  automaticResults.push(result);
+  state.automaticResults.push(result);
   void result.catch(() => undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let continuation: WorkflowContinuedAsNewError;
@@ -170,19 +242,61 @@ async function closedContinuation(handle: Handle) {
   expect(event!.newExecutionRunId).toBe(continuation.newExecutionRunId);
   return { pinned, history, input: supervisorContinuationInput(defaultPayloadConverter.fromPayload(event!.input!.payloads![0]!)), runId: event!.newExecutionRunId };
 }
-async function stop(handle: Handle) {
+async function stop(handle: Handle, state = currentCase()) {
+  const env = caseEnvironment(state);
   try { await env.client.workflow.getHandle(handle.workflowId).terminate("Synthetic test cleanup"); }
   catch (error) { if (!(error instanceof WorkflowNotFoundError)) throw error; }
 }
-async function teardownEnvironment() {
-  if (!environmentActive) return;
-  try {
-    for (const worker of workers) if (worker.getState() === "RUNNING") worker.shutdown();
-    await Promise.all(running);
-  } finally {
-    try { await env.teardown(); }
-    finally { environmentActive = false; }
+function teardownEnvironment(state = activeCase): Promise<void> {
+  if (!state) return Promise.resolve();
+  if (!state.teardownPromise) {
+    const close = (async () => {
+      // Setup may still complete after its hook timed out. Keep ownership until
+      // its exact environment/workers have been acquired and then closed.
+      await state.setupPromise.catch(() => undefined);
+      releaseCaseGates(state);
+      const failures: unknown[] = [];
+      try {
+        for (const worker of state.workers) {
+          try { if (worker.getState() === "RUNNING") worker.shutdown(); }
+          catch (error) { failures.push(error); }
+        }
+        if (failures.length) throw new AggregateError(failures, "Sandbox worker shutdown failed");
+        const outcomes = await Promise.allSettled(state.running);
+        for (const outcome of outcomes) if (outcome.status === "rejected") failures.push(outcome.reason);
+      } finally { await state.env?.teardown(); }
+      // SDK shutdown can abandon an uncooperative activity body. Its promise
+      // must settle before another case may replace count()/calls/stubs aliases.
+      while (state.activities.size) await Promise.allSettled([...state.activities]);
+      if (failures.length) throw new AggregateError(failures, "Sandbox worker shutdown failed");
+    })();
+    // Do not clear the owner in finally. A failed/timed-out close stays closed
+    // to new cases, even if its underlying asynchronous operation finishes later.
+    state.teardownPromise = within(close, 10_000, "sandbox teardown").then(() => {
+      if (activeCase === state) activeCase = undefined;
+    });
   }
+  return state.teardownPromise;
+}
+function cleanupCase(state: SandboxCase): Promise<void> {
+  if (!state.cleanupPromise) {
+    const cleanup = (async () => {
+      await state.setupPromise;
+      try {
+        const outcomes = await Promise.allSettled(state.handles.map((handle) => stop(handle, state)));
+        const failures = outcomes.filter((outcome) => outcome.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map((outcome) => outcome.reason), "Sandbox workflow cleanup failed");
+      } finally { releaseCaseGates(state); }
+      await Promise.allSettled(state.automaticResults);
+      await until(() => state.workers.every((worker) => worker.getStatus().numInFlightActivities === 0), "activity cleanup before server teardown");
+      expect(state.unexpectedActivities, "A missing activity stub must not be swallowed by a production catch block").toEqual([]);
+    })();
+    state.cleanupPromise = (async () => {
+      try { await within(cleanup, 15_000, "sandbox activity cleanup"); }
+      finally { await teardownEnvironment(state); }
+    })();
+  }
+  return state.cleanupPromise;
 }
 
 // Reuse the compiled bundle, but give each case its own real server and clock.
@@ -192,56 +306,39 @@ describe.sequential("real Temporal sandbox and recorded replay compatibility", (
   beforeAll(async () => {
     bundle = await bundleWorkflowCode({ workflowsPath });
   }, 60_000);
-  beforeEach(async () => {
-    calls = []; stubs = {}; handles = []; unexpectedActivities = [];
-    releaseGates = []; automaticResults = []; workers = []; running = [];
-    env = await TestWorkflowEnvironment.createTimeSkipping({ client: { identity: "space-synthetic-test-client" } });
-    environmentActive = true;
-    const activities = Object.fromEntries(activityNames.map((name) => [name, async (...args: any[]) => {
-      const info = Context.current().info;
-      if (!info.workflowExecution) throw new Error("Test activity requires a workflow execution");
-      calls.push({ name, args, attempt: info.attempt, workflowId: info.workflowExecution.workflowId, runId: info.workflowExecution.runId });
-      if (!stubs[name]) {
-        unexpectedActivities.push(name);
-        throw ApplicationFailure.nonRetryable(`Unexpected test activity: ${name}`);
+  beforeEach(async (context) => {
+    const state = beginCase(context);
+    // The guard runs synchronously before replacing these convenience aliases.
+    calls = state.calls; stubs = state.stubs;
+    state.setupPromise = (async () => {
+      state.env = await TestWorkflowEnvironment.createTimeSkipping({ client: { identity: "space-synthetic-test-client" } });
+      env = state.env;
+      const activities = Object.fromEntries(activityNames.map((name) => [name, caseActivity(state, name)]));
+      // Register each worker immediately so partial setup remains owned.
+      for (const taskQueue of ["space-sandbox-tests", MEMORY_MAINTENANCE_TASK_QUEUE, MEMORY_MUTATION_TASK_QUEUE]) {
+        const worker = await Worker.create({
+          connection: state.env.nativeConnection, taskQueue, workflowBundle: bundle, activities,
+          identity: "space-synthetic-test-worker",
+          patchActivationCallback: ({ workflowInfo, patchId }) => !(patchId === branchPatch && workflowInfo.workflowId.includes("legacy")),
+          maxHeartbeatThrottleInterval: "100 milliseconds",
+          defaultHeartbeatThrottleInterval: "100 milliseconds",
+          shutdownGraceTime: "1 second"
+        });
+        state.workers.push(worker);
+        const run = worker.run();
+        state.running.push(run);
+        void run.catch(() => undefined);
       }
-      return stubs[name](...args);
-    }]));
-    // Retain each successfully created worker immediately: if a later worker
-    // creation fails, teardown still stops the earlier ones and the server.
-    for (const taskQueue of ["space-sandbox-tests", MEMORY_MAINTENANCE_TASK_QUEUE, MEMORY_MUTATION_TASK_QUEUE]) {
-      const worker = await Worker.create({
-      connection: env.nativeConnection, taskQueue, workflowBundle: bundle, activities,
-      identity: "space-synthetic-test-worker",
-      // Official SDK switch: execute the real legacy branch and record no patch
-      // marker. Replay later uses unmodified production code and the history.
-      patchActivationCallback: ({ workflowInfo, patchId }) => !(patchId === branchPatch && workflowInfo.workflowId.includes("legacy")),
-      // Cancellation is communicated to our heartbeating activity stub by the
-      // real SDK. Keep test-worker throttling short instead of waiting for the
-      // production heartbeat timeout's default 80% throttle in wall-clock time.
-      maxHeartbeatThrottleInterval: "100 milliseconds",
-      defaultHeartbeatThrottleInterval: "100 milliseconds",
-      shutdownGraceTime: "1 second"
-      });
-      workers.push(worker);
-      const run = worker.run();
-      running.push(run);
-      void run.catch(() => undefined);
-    }
+    })();
+    await state.setupPromise;
   }, 60_000);
-  afterEach(async () => {
-    if (!environmentActive) return;
-    try {
-      try { await Promise.all(handles.map(stop)); }
-      finally { for (const release of releaseGates) release(); }
-      await Promise.allSettled(automaticResults);
-      await until(() => workers.every((worker) => worker.getStatus().numInFlightActivities === 0), "activity cleanup before server teardown");
-      expect(unexpectedActivities, "A missing activity stub must not be swallowed by a production catch block").toEqual([]);
-    } finally { await teardownEnvironment(); }
-  }, 15_000);
+  afterEach(async (context) => {
+    // A beforeEach rejected by the ownership guard did not create this case.
+    const state = casesByContext.get(context);
+    if (state) await cleanupCase(state);
+  }, 30_000);
   afterAll(async () => {
-    // Fallback also covers a partially initialized case whose setup failed.
-    await teardownEnvironment();
+    await teardownEnvironment(activeCase);
   }, 15_000);
 
   it("dot goal keeps a wake arriving during activity, and separately exercises the real timeout", async () => {
