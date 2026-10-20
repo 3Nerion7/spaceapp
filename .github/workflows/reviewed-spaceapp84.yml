@@ -1,0 +1,167 @@
+name: Reviewed SpaceApp candidate 84
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  TZ: UTC
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+  SPACE_TEMPORAL_RECORD_HISTORIES: '0'
+
+jobs:
+  temporal-exact-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the exact reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: 3Nerion7/spaceapp
+          ref: 810079af9acc525d2d047ab3ac1b6bf37cc48faf
+          persist-credentials: false
+      - name: Verify commit, tree and changed-file bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 810079af9acc525d2d047ab3ac1b6bf37cc48faf
+          test "$(git rev-parse 'HEAD^{tree}')" = 992c0900930a9615c689e9255b9bc4e799da9076
+          test -z "$(git status --porcelain)"
+          cat > "$RUNNER_TEMP/reviewed84.sha256" <<'SOURCE_SHA256'
+          7856a0f53b3a476f0ec93d7cc4da1fcca7e850775b2e5d118c7a8ce3f7e7ab8a  .github/workflows/temporal-replay.yml
+          b3f8aa0bec46e639a5d8a46c56dd280e1740b228393778a7dadec1906be9141f  apps/api/tests/room-watchdog.test.ts
+          272ac7433bf89dc3c4d680bc77b412498743208a4684573c090935bdaeef90e9  apps/api/tests/space-control-capture.test.ts
+          f4a57c9e02339bb68fc8b8bd0082a0931a74e808edcbedec574664fe537b29a3  apps/worker/package.json
+          103eab80f8d9a96d8954d7b01a3566e2cbde9ca6222b80d53ca8df19e0a64c1c  apps/worker/tests/fixtures/workflow-histories/README.md
+          669f8f2a37378b6edfad77c41f0370da2ed896803d0977c7c0ff4b3c4c66f4ba  apps/worker/tests/fixtures/workflow-histories/codex-turn-retry.json
+          bd877a561855620e167744e215467e20409e71e1a1a9b2b14aa406e4cb16b26e  apps/worker/tests/fixtures/workflow-histories/dot-goal-wake.json
+          b77d3a1389e87f097de6b4d30ed91f60f94030c34c285bf66fbd7aa57dfe191d  apps/worker/tests/fixtures/workflow-histories/dummy-turn-retry.json
+          75988e4a90837703e5963510ef8cbb9074690ae1f181d72c3b02e7cdb1109241  apps/worker/tests/fixtures/workflow-histories/memory-consolidation-change.json
+          608162c52fb0e65dffa00a03518fb179ebd1fc5047b4effd1a58a95d417a681f  apps/worker/tests/fixtures/workflow-histories/memory-maintenance-child.json
+          e9ac8828e6029e8b06663bd7b6bb2d9f7ea0311e653b504c067bc2ba492bbfc8  apps/worker/tests/fixtures/workflow-histories/memory-mutation-retry.json
+          19f4cd5a21eb2d813e0289487789d8ce02ed08b8a76ee5f0881fe1a836ef0898  apps/worker/tests/fixtures/workflow-histories/room-action-failure.json
+          71dfa94639d310a30d68a68d798bb20dfada1e838567e588e2c7e5bafb574025  apps/worker/tests/fixtures/workflow-histories/supervisor-current-continuation.json
+          90c108f3200ed93f2359c93abb0d38d34fcf31a215a096d72e1314255339bb13  apps/worker/tests/fixtures/workflow-histories/supervisor-legacy-continuation.json
+          6dbe7ac489e02ff5ac94b0628427cfbc379ec6e5d8f1d12dad379be85152bd58  apps/worker/tests/record-temporal-histories.mjs
+          c4a24b9b640bd1673f470aca328b2826c595d4a253716c0b4915a7a596139922  apps/worker/tests/room-continuation-fixture.ts
+          741dc87d4932d0aeae3655b31eb275f48c8b9045f9db2d386186a68e8557c8af  apps/worker/tests/support/temporal-nondeterministic-workflows.ts
+          c473e29712c23645722c52dece5f022e046ff1c3b990738482e73198b6ddf558  apps/worker/tests/support/temporal-real-workflows.ts
+          87c7e4d1a753dfc851f531b64f7c316dbe9f5c002a4cc9180e733cf32544edf4  apps/worker/tests/temporal-workflows.test.ts
+          e8c7d03fba172eef25c8b880556fabd77bafd67de3178d5b78d5e5a45957ec12  apps/worker/tsconfig.temporal-tests.json
+          fef9c5163c16c3d2e5bee71f3a1e1e7c3c9819cf4dd4c439975d85588db5e849  package-lock.json
+          e2761ce0d9ecf815666534ffb231a595b1c602c5f5bc59f9abf4f72503f7fe92  packages/gateway/tests/server.test.ts
+          SOURCE_SHA256
+          sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.0'
+      - name: Check source checkout hygiene
+        run: npm run hygiene:preflight
+      - name: Create sanitized candidate export
+        run: node scripts/public-export.mjs --output "$RUNNER_TEMP/spaceapp-reviewed84"
+      - name: Verify exported changed-file bytes
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - name: Install the committed dependency lock
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm ci --no-audit --no-fund
+      - name: Build dependencies and check production types
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm run check
+      - name: Strictly check the Temporal tests and imported fixtures
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm run check:temporal-tests -w @space/worker
+      - name: Run real sandbox and replay within 180 seconds
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: timeout --signal=TERM --kill-after=10s 180s npm test -w @space/worker -- tests/temporal-workflows.test.ts
+      - name: Verify source bytes after execution
+        if: always()
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - name: Verify export bytes after execution
+        if: always()
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+
+  full-exact-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout the exact reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: 3Nerion7/spaceapp
+          ref: 810079af9acc525d2d047ab3ac1b6bf37cc48faf
+          persist-credentials: false
+      - name: Verify commit, tree and changed-file bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 810079af9acc525d2d047ab3ac1b6bf37cc48faf
+          test "$(git rev-parse 'HEAD^{tree}')" = 992c0900930a9615c689e9255b9bc4e799da9076
+          test -z "$(git status --porcelain)"
+          cat > "$RUNNER_TEMP/reviewed84.sha256" <<'SOURCE_SHA256'
+          7856a0f53b3a476f0ec93d7cc4da1fcca7e850775b2e5d118c7a8ce3f7e7ab8a  .github/workflows/temporal-replay.yml
+          b3f8aa0bec46e639a5d8a46c56dd280e1740b228393778a7dadec1906be9141f  apps/api/tests/room-watchdog.test.ts
+          272ac7433bf89dc3c4d680bc77b412498743208a4684573c090935bdaeef90e9  apps/api/tests/space-control-capture.test.ts
+          f4a57c9e02339bb68fc8b8bd0082a0931a74e808edcbedec574664fe537b29a3  apps/worker/package.json
+          103eab80f8d9a96d8954d7b01a3566e2cbde9ca6222b80d53ca8df19e0a64c1c  apps/worker/tests/fixtures/workflow-histories/README.md
+          669f8f2a37378b6edfad77c41f0370da2ed896803d0977c7c0ff4b3c4c66f4ba  apps/worker/tests/fixtures/workflow-histories/codex-turn-retry.json
+          bd877a561855620e167744e215467e20409e71e1a1a9b2b14aa406e4cb16b26e  apps/worker/tests/fixtures/workflow-histories/dot-goal-wake.json
+          b77d3a1389e87f097de6b4d30ed91f60f94030c34c285bf66fbd7aa57dfe191d  apps/worker/tests/fixtures/workflow-histories/dummy-turn-retry.json
+          75988e4a90837703e5963510ef8cbb9074690ae1f181d72c3b02e7cdb1109241  apps/worker/tests/fixtures/workflow-histories/memory-consolidation-change.json
+          608162c52fb0e65dffa00a03518fb179ebd1fc5047b4effd1a58a95d417a681f  apps/worker/tests/fixtures/workflow-histories/memory-maintenance-child.json
+          e9ac8828e6029e8b06663bd7b6bb2d9f7ea0311e653b504c067bc2ba492bbfc8  apps/worker/tests/fixtures/workflow-histories/memory-mutation-retry.json
+          19f4cd5a21eb2d813e0289487789d8ce02ed08b8a76ee5f0881fe1a836ef0898  apps/worker/tests/fixtures/workflow-histories/room-action-failure.json
+          71dfa94639d310a30d68a68d798bb20dfada1e838567e588e2c7e5bafb574025  apps/worker/tests/fixtures/workflow-histories/supervisor-current-continuation.json
+          90c108f3200ed93f2359c93abb0d38d34fcf31a215a096d72e1314255339bb13  apps/worker/tests/fixtures/workflow-histories/supervisor-legacy-continuation.json
+          6dbe7ac489e02ff5ac94b0628427cfbc379ec6e5d8f1d12dad379be85152bd58  apps/worker/tests/record-temporal-histories.mjs
+          c4a24b9b640bd1673f470aca328b2826c595d4a253716c0b4915a7a596139922  apps/worker/tests/room-continuation-fixture.ts
+          741dc87d4932d0aeae3655b31eb275f48c8b9045f9db2d386186a68e8557c8af  apps/worker/tests/support/temporal-nondeterministic-workflows.ts
+          c473e29712c23645722c52dece5f022e046ff1c3b990738482e73198b6ddf558  apps/worker/tests/support/temporal-real-workflows.ts
+          87c7e4d1a753dfc851f531b64f7c316dbe9f5c002a4cc9180e733cf32544edf4  apps/worker/tests/temporal-workflows.test.ts
+          e8c7d03fba172eef25c8b880556fabd77bafd67de3178d5b78d5e5a45957ec12  apps/worker/tsconfig.temporal-tests.json
+          fef9c5163c16c3d2e5bee71f3a1e1e7c3c9819cf4dd4c439975d85588db5e849  package-lock.json
+          e2761ce0d9ecf815666534ffb231a595b1c602c5f5bc59f9abf4f72503f7fe92  packages/gateway/tests/server.test.ts
+          SOURCE_SHA256
+          sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.0'
+      - name: Check source checkout hygiene
+        run: npm run hygiene:preflight
+      - name: Create sanitized candidate export
+        run: node scripts/public-export.mjs --output "$RUNNER_TEMP/spaceapp-reviewed84"
+      - name: Verify exported changed-file bytes
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - name: Install the committed dependency lock
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm ci --no-audit --no-fund
+      - name: Build dependencies and check production types
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm run check
+      - name: Strictly check the Temporal tests and imported fixtures
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm run check:temporal-tests -w @space/worker
+      - name: Install required public-test system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg ripgrep
+          ffmpeg -version
+          rg --version
+      - name: Run the complete public test command
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: timeout --signal=TERM --kill-after=10s 3600s npm test
+      - name: Build the sanitized candidate
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: npm run build
+      - name: Verify source bytes after execution
+        if: always()
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
+      - name: Verify export bytes after execution
+        if: always()
+        working-directory: ${{ runner.temp }}/spaceapp-reviewed84
+        run: sha256sum --check "$RUNNER_TEMP/reviewed84.sha256"
